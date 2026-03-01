@@ -1,15 +1,7 @@
-import collections
-import itertools
-import multiprocessing as mp
 import numpy as np
-import pandas as pd
-import plotly.express as px
 import tqdm
 from copy import deepcopy
 from functools import lru_cache
-
-
-np.random.seed(0)
 
 
 def bayesian_update(priors):
@@ -128,7 +120,6 @@ def find_partitions_optimal(X, thresholds, priors, threshold_true, c):
 
 
 if __name__ == "__main__":
-    _GLOBALS = {}
     c = 5.0
     threshold_true = 0.5
 
@@ -139,9 +130,6 @@ if __name__ == "__main__":
     # priors = np.zeros_like(thresholds)
     priors = np.array([0.11393634, 0.11459784, 0.03594993, 0.25, 0.02203078, 0.05390004, 0.06215049, 0.09743458, 0.25])
     # balance_priors(priors, random=True)
-
-    # print(np.sum(priors))
-    # pd.DataFrame({"threshold": thresholds, "priors": priors}).round(3).T
 
     partition_optimal = find_partitions_optimal(X, thresholds, priors, threshold_true, c)
     acc_loss_optimal = evaluate_system(X, partition_optimal, thresholds, priors, threshold_true, c)
