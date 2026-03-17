@@ -1,11 +1,14 @@
 """
-Optimized grid search for approximation ratio.
+Approximation ratio evaluation using greedy-best (priority-queue greedy).
 
-Optimizations over the notebook version:
-1. Partition enumeration is done once per (n, thresholds) config, not per (c, threshold_true) pair.
-2. best_response_vectorized is precomputed for each (block, c) pair since it doesn't depend on
-   threshold_true -- reducing calls by a factor of len(thresholds_true).
-3. The (threshold_true, c) grid is parall elized with joblib.
+Loads existing results from results/grid_search_approx_ratio_fast.pkl (which contains
+opt and standard greedy baselines) and runs find_partitions_greedy_best_fast for each row.
+
+Key optimizations:
+1. Rows are grouped by (thresholds, priors, c) so best responses are precomputed once per group,
+   not once per (threshold_true) row -- saving a factor of len(thresholds_true) evaluations.
+2. Within each group, (threshold_true) tasks are parallelized with joblib.
+3. The priority-queue greedy always merges the most beneficial pair first.
 """
 
 import sys
@@ -17,7 +20,7 @@ import pandas as pd
 import tqdm
 import pickle
 from copy import deepcopy
-import collections
+import heapq
 import itertools
 from joblib import Parallel, delayed
 
@@ -78,31 +81,31 @@ def find_partitions_optimal_fast(all_partitions, unique_blocks, X, thresholds, p
     return best_partition, best_loss
 
 
+
 # ---------------------------------------------------------------------------
-# Optimized greedy partition search
+# Optimized greedy-best partition search (priority queue + precomputed X_p)
 # ---------------------------------------------------------------------------
 
-def find_partitions_greedy_fast(X, thresholds, priors, Xp_cache_c, threshold_true):
+def find_partitions_greedy_best_fast(X, thresholds, priors, Xp_cache_c, threshold_true):
     """
-    Greedy partition search using precomputed X_p for fixed c.
+    Best-first greedy partition search using precomputed X_p for fixed c.
+
+    Always merges the pair with the greatest loss reduction (priority queue),
+    unlike find_partitions_greedy_fast which processes pairs in FIFO order.
 
     Parameters
     ----------
     X : np.ndarray, shape (N,)
-        Original feature vector.
     thresholds, priors : np.ndarray, shape (n,)
     Xp_cache_c : dict[block_tuple -> np.ndarray]
         Precomputed best responses for the current c value.
     threshold_true : float
     """
     n = len(thresholds)
-    P = {i: (i,) for i in range(n)}  # id -> block_tuple
+    P = {i: (i,) for i in range(n)}
     next_id = n
 
-    Q = collections.deque(itertools.combinations(range(n), 2))
-
     loss_cache = {}
-
     def get_loss(block_tuple):
         if block_tuple not in loss_cache:
             loss_cache[block_tuple] = _block_weighted_loss(
@@ -110,13 +113,20 @@ def find_partitions_greedy_fast(X, thresholds, priors, Xp_cache_c, threshold_tru
             )
         return loss_cache[block_tuple]
 
-    while Q:
-        a_id, b_id = Q.popleft()
+    # Priority queue: (gain_neg, a_id, b_id) — most beneficial merge first
+    pq = []
+    for a_id, b_id in itertools.combinations(range(n), 2):
+        a, b = P[a_id], P[b_id]
+        ab = tuple(sorted(a + b))
+        gain_neg = -(get_loss(a) + get_loss(b) - get_loss(ab))
+        heapq.heappush(pq, (gain_neg, a_id, b_id))
+
+    while pq:
+        gain_neg, a_id, b_id = heapq.heappop(pq)
         if a_id not in P or b_id not in P:
             continue
 
-        a = P[a_id]
-        b = P[b_id]
+        a, b = P[a_id], P[b_id]
         ab = tuple(sorted(a + b))
 
         lhs = get_loss(a) + get_loss(b)
@@ -126,18 +136,22 @@ def find_partitions_greedy_fast(X, thresholds, priors, Xp_cache_c, threshold_tru
             del P[a_id]
             del P[b_id]
 
-            Q = collections.deque(
-                (x, y) for (x, y) in Q
-                if x not in {a_id, b_id} and y not in {a_id, b_id}
-            )
+            pq2 = []
+            for gain_neg, x_id, y_id in pq:
+                if x_id not in {a_id, b_id} and y_id not in {a_id, b_id}:
+                    heapq.heappush(pq2, (gain_neg, x_id, y_id))
+            pq = deepcopy(pq2)
 
             new_id = next_id
             next_id += 1
             P[new_id] = ab
 
-            for c_id in P:
-                if c_id != new_id:
-                    Q.append((new_id, c_id))
+            for c_id, c in P.items():
+                if c_id == new_id:
+                    continue
+                abc = tuple(sorted(ab + c))
+                gain_neg = -(get_loss(ab) + get_loss(c) - get_loss(abc))
+                heapq.heappush(pq, (gain_neg, new_id, c_id))
 
     return [list(block) for block in P.values()]
 
@@ -183,7 +197,7 @@ def run(threshold_true, c, all_partitions, unique_blocks, X, thresholds, priors,
         all_partitions, unique_blocks, X, thresholds, priors, Xp_cache_c, threshold_true
     )
 
-    partition_greedy = find_partitions_greedy_fast(
+    partition_greedy = find_partitions_greedy_best_fast(
         X, thresholds, priors, Xp_cache_c, threshold_true
     )
 
@@ -207,6 +221,7 @@ def run(threshold_true, c, all_partitions, unique_blocks, X, thresholds, priors,
         "r_mult": r_mult,
         "r_add": r_add,
     }
+
 
 def generate_prior_grid(n_components=3, n_balls=50):
     step = 1.0 / n_balls
@@ -287,13 +302,12 @@ if __name__ == "__main__":
     X = np.arange(0., 1. + 1e-4, 1e-4).round(4)
     N_THRESHOLDS = 3
 
-    N_THRESHOLDS = 3
-    step = 0.2
+    step = 0.05
     step_tt = 0.1
-    n_balls = 25
+    n_balls = 50
     threshold_grid = generate_threshold_grid(n_components=N_THRESHOLDS, step=step)
     prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)
-    threshold_true_grid = [0.1, 0.3, 0.5, 0.7, 0.9]
+    threshold_true_grid = np.arange(step_tt, 1+step_tt, step_tt).round(5)
     c_grid = [0.75]
 
     all_results = []
@@ -313,7 +327,6 @@ if __name__ == "__main__":
     print(results_df.shape)
     print(results_df.head())
 
-    filepath = "grid_search_approx_ratio_n5.pkl"
-    with open(filepath, "wb") as f:
+    with open("grid_search_approx_ratio_best.pkl", "wb") as f:
         pickle.dump(results_df, f)
-    print(f"Saved to {filepath}")
+    print("Saved to grid_search_approx_ratio_best.pkl")
