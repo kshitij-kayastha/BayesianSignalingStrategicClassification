@@ -9,10 +9,10 @@ def best_response(x, thresholds, priors, c):
     posteriors = normalize_priors(priors)
     search_space = [x] + thresholds[thresholds > x].tolist()
     utilities = []
-    for x_p in search_space:
+    for i, x_p in enumerate(search_space):
         utility = np.dot(posteriors, x_p >= thresholds)
         cost = c * abs(x-x_p)
-        utilities.append(utility - cost)
+        utilities.append(utility - cost + (i*1e-6))
     return search_space[np.argmax(utilities)]
 
 def best_response_vectorized(X, thresholds, priors, c):
