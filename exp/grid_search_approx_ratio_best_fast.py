@@ -300,9 +300,9 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     X = np.arange(0., 1. + 1e-4, 1e-4).round(4)
-    N_THRESHOLDS = 3
+    N_THRESHOLDS = 4
 
-    step = 0.05
+    step = 0.2
     step_tt = 0.1
     n_balls = 50
     threshold_grid = generate_threshold_grid(n_components=N_THRESHOLDS, step=step)
