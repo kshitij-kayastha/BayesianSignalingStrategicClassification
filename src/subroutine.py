@@ -12,7 +12,7 @@ def best_response(x, thresholds, priors, c):
     for i, x_p in enumerate(search_space):
         utility = np.dot(posteriors, x_p >= thresholds)
         cost = c * abs(x-x_p)
-        utilities.append(utility - cost + (i*1e-6))
+        utilities.append(utility - cost + ((len(search_space)-i)*1e-6))
     return search_space[np.argmax(utilities)]
 
 def best_response_vectorized(X, thresholds, priors, c):
@@ -34,7 +34,7 @@ def best_response_vectorized(X, thresholds, priors, c):
 
     utilities = np.concatenate([utility_stay[:, None], utility_jump],axis=1)
 
-    best_idx = np.argmax(utilities + np.array([i*1e-6 for i in range(utilities.shape[1])]), axis=1)
+    best_idx = np.argmax(utilities + np.array([(utilities.shape[1] - i)*1e-6 for i in range(utilities.shape[1])]), axis=1)
     X_p = np.where(best_idx == 0, X, thresholds[best_idx - 1])
 
     return X_p
