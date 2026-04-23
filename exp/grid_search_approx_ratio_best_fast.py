@@ -300,14 +300,15 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     X = np.arange(0., 1. + 1e-4, 1e-4).round(4)
-    N_THRESHOLDS = 4
+    N_THRESHOLDS = 5
 
     step = 0.2
-    step_tt = 0.1
-    n_balls = 50
+    # step_tt = 0.1
+    n_balls = 40
     threshold_grid = generate_threshold_grid(n_components=N_THRESHOLDS, step=step)
     prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)
-    threshold_true_grid = np.arange(step_tt, 1+step_tt, step_tt).round(5)
+    # threshold_true_grid = np.arange(step_tt, 1+step_tt, step_tt).round(5)
+    threshold_true_grid = [0.1]
     c_grid = [0.75]
 
     all_results = []
@@ -327,6 +328,6 @@ if __name__ == "__main__":
     print(results_df.shape)
     print(results_df.head())
 
-    with open("grid_search_approx_ratio_best.pkl", "wb") as f:
+    with open("grid_search_approx_ratio_best_n5.pkl", "wb") as f:
         pickle.dump(results_df, f)
     print("Saved to grid_search_approx_ratio_best.pkl")
