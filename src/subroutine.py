@@ -2,7 +2,7 @@ import numpy as np
 
 def normalize_priors(priors):
     if np.sum(priors) == 0:
-        return np.zeros_like(priors)
+        return np.ones_like(priors)
     return priors / np.sum(priors)
 
 def best_response(x, thresholds, priors, c):
@@ -16,7 +16,7 @@ def best_response(x, thresholds, priors, c):
     return search_space[np.argmax(utilities)]
 
 def best_response_vectorized(X, thresholds, priors, c):
-    posteriors = normalize_priors(priors)
+    posteriors = normalize_priors(priors).flatten()
     utilities_expected = np.array([
         np.dot(posteriors, thresholds[j] >= thresholds)
         for j in range(len(thresholds))
@@ -32,11 +32,9 @@ def best_response_vectorized(X, thresholds, priors, c):
     utility_jump = utilities_expected[None, :] - c * np.abs(thresholds_row - X_col)
     utility_jump[~feasible] = -np.inf
 
-    utilities = np.concatenate([utility_stay[:, None], utility_jump],axis=1)
-
+    utilities = np.concatenate([utility_stay[:, None], utility_jump], axis=1)
     best_idx = np.argmax(utilities + np.array([(utilities.shape[1] - i)*1e-6 for i in range(utilities.shape[1])]), axis=1)
     X_p = np.where(best_idx == 0, X, thresholds[best_idx - 1])
-
     return X_p
 
 def accuracy_loss(X, X_p, thresholds, priors, threshold_true):
@@ -57,17 +55,14 @@ def accuracy_loss_vectorized(X, X_p, thresholds, priors, threshold_true):
     posteriors = normalize_priors(priors)
     return np.dot(losses, posteriors)
 
-def evaluate_partition(X, partition, thresholds, priors, threshold_true, c, return_all=False):
+def evaluate_partition(X, partition, thresholds, priors, threshold_true, c):
     thresholds_p = thresholds[partition]
-    priors_p = priors[partition]
+    priors_p     = priors[partition]
     X_p = best_response_vectorized(X, thresholds_p, priors_p, c)
-    acc_loss_p = accuracy_loss_vectorized(X, X_p, thresholds_p, priors_p, threshold_true)
-    if return_all:
-        return acc_loss_p, thresholds_p, priors_p
-    return acc_loss_p
+    return accuracy_loss_vectorized(X, X_p, thresholds_p, priors_p, threshold_true)
 
 def evaluate_system(X, partitions, thresholds, priors, threshold_true, c):
-    acc_loss = 0.
+    acc_loss = 0.0
     for partition in partitions:
         acc_loss_p = evaluate_partition(X, partition, thresholds, priors, threshold_true, c)
         acc_loss += acc_loss_p * np.sum(priors[partition])
