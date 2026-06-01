@@ -163,9 +163,9 @@ def run(threshold_true, all_partitions, n, X, X_eps, thresholds, priors, Xp_cach
     partition_opt = find_partitions_optimal(all_partitions, block_loss)
     partition_greedy = find_partitions_greedy_agglomerative([[i] for i in range(n)], block_loss)
     partition_greedy_div = find_partitions_greedy_divisive(n, block_loss, full_split=False)
-    partition_greedy_div_plus = find_partitions_greedy_divisive(n, block_loss, full_split=True)
-    partition_greedy_div_forward = find_partitions_greedy_agglomerative(partition_greedy_div, block_loss)
-    partition_greedy_div_plus_forward = find_partitions_greedy_agglomerative(partition_greedy_div_plus, block_loss)
+    partition_greedy_div2 = find_partitions_greedy_divisive(n, block_loss, full_split=True)
+    partition_greedy_div_agg = find_partitions_greedy_agglomerative(partition_greedy_div, block_loss)
+    partition_greedy_div2_agg = find_partitions_greedy_agglomerative(partition_greedy_div2, block_loss)
 
     def loss(p):
         return compute_system_loss(p, X, thresholds, priors, Xp_cache, float(threshold_true))
@@ -176,16 +176,16 @@ def run(threshold_true, all_partitions, n, X, X_eps, thresholds, priors, Xp_cach
         "partition_opt": partition_opt,
         "partition_greedy": partition_greedy,
         "partition_greedy_div": partition_greedy_div,
-        "partition_greedy_div2": partition_greedy_div_plus,
-        "partition_greedy_div_agg": partition_greedy_div_forward,
-        "partition_greedy_div2_agg": partition_greedy_div_plus_forward,
+        "partition_greedy_div2": partition_greedy_div2,
+        "partition_greedy_div_agg": partition_greedy_div_agg,
+        "partition_greedy_div2_agg": partition_greedy_div2_agg,
         "loss_base": loss(partition_base),
         "loss_opt": loss(partition_opt),
         "loss_greedy": loss(partition_greedy),
         "loss_greedy_div": loss(partition_greedy_div),
-        "loss_greedy_div2": loss(partition_greedy_div_plus),
-        "loss_greedy_div_agg": loss(partition_greedy_div_forward),
-        "loss_greedy_div2_agg": loss(partition_greedy_div_plus_forward),
+        "loss_greedy_div2": loss(partition_greedy_div2),
+        "loss_greedy_div_agg": loss(partition_greedy_div_agg),
+        "loss_greedy_div2_agg": loss(partition_greedy_div2_agg),
     }
 
 

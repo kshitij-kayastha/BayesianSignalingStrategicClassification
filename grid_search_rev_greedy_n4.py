@@ -154,6 +154,14 @@ def find_partitions_greedy_divisive(n, block_loss, full_split=False):
         if not pq:
             return partition_merged
 
+def approximation_ratio(loss_optimal, loss_greedy, rtype="m"):
+    if rtype in ["a", "add", "additive"]:
+        return loss_greedy - loss_optimal
+    elif rtype in ["m", "mult", "multiplicative"]:
+        if loss_optimal == 0:
+            return np.nan
+        return loss_greedy / loss_optimal
+
 
 def run(threshold_true, all_partitions, n, X, X_eps, thresholds, priors, Xp_cache, Xp_eps_cache):
     block_loss = make_block_loss(X, X_eps, thresholds, priors, Xp_cache, Xp_eps_cache,
@@ -161,31 +169,45 @@ def run(threshold_true, all_partitions, n, X, X_eps, thresholds, priors, Xp_cach
 
     partition_base = [[i] for i in range(n)]
     partition_opt = find_partitions_optimal(all_partitions, block_loss)
-    partition_greedy = find_partitions_greedy_agglomerative([[i] for i in range(n)], block_loss)
-    partition_greedy_div = find_partitions_greedy_divisive(n, block_loss, full_split=False)
-    partition_greedy_div_plus = find_partitions_greedy_divisive(n, block_loss, full_split=True)
-    partition_greedy_div_forward = find_partitions_greedy_agglomerative(partition_greedy_div, block_loss)
-    partition_greedy_div_plus_forward = find_partitions_greedy_agglomerative(partition_greedy_div_plus, block_loss)
+    partition_greedy_agg = find_partitions_greedy_agglomerative([[i] for i in range(n)], block_loss)
+    # partition_greedy_div = find_partitions_greedy_divisive(n, block_loss, full_split=False)
+    partition_greedy_div2 = find_partitions_greedy_divisive(n, block_loss, full_split=True)
+    # partition_greedy_div_forward = find_partitions_greedy_agglomerative(partition_greedy_div, block_loss)
+    # partition_greedy_div_plus_forward = find_partitions_greedy_agglomerative(partition_greedy_div_plus, block_loss)
 
     def loss(p):
         return compute_system_loss(p, X, thresholds, priors, Xp_cache, float(threshold_true))
+
+    loss_base = loss(partition_base)
+    loss_opt = loss(partition_opt)
+    loss_greedy_agg = loss(partition_greedy_agg)
+    loss_greedy_div2 = loss(partition_greedy_div2)
+
+    r_mult_agg = approximation_ratio(loss_opt, loss_greedy_agg)
+    r_add_agg = approximation_ratio(loss_opt, loss_greedy_agg, "a")
+    r_mult_div2 = approximation_ratio(loss_opt, loss_greedy_div2)
+    r_add_div2 = approximation_ratio(loss_opt, loss_greedy_div2, "a")
 
     return {
         "threshold_true": float(threshold_true),
         "partition_base": partition_base,
         "partition_opt": partition_opt,
-        "partition_greedy_agg": partition_greedy,
-        "partition_greedy_div": partition_greedy_div,
-        "partition_greedy_div2": partition_greedy_div_plus,
-        "partition_greedy_div_agg": partition_greedy_div_forward,
-        "partition_greedy_div2_agg": partition_greedy_div_plus_forward,
-        "loss_base": loss(partition_base),
-        "loss_opt": loss(partition_opt),
-        "loss_greedy_agg": loss(partition_greedy),
-        "loss_greedy_div": loss(partition_greedy_div),
-        "loss_greedy_div2": loss(partition_greedy_div_plus),
-        "loss_greedy_div_agg": loss(partition_greedy_div_forward),
-        "loss_greedy_div2_agg": loss(partition_greedy_div_plus_forward),
+        "partition_greedy_agg": partition_greedy_agg,
+        # "partition_greedy_div": partition_greedy_div,
+        "partition_greedy_div2": partition_greedy_div2,
+        # "partition_greedy_div_agg": partition_greedy_div_forward,
+        # "partition_greedy_div2_agg": partition_greedy_div_plus_forward,
+        "loss_base": loss_base,
+        "loss_opt": loss_opt,
+        "loss_greedy_agg": loss_greedy_agg,
+        # "loss_greedy_div": loss(partition_greedy_div),
+        "loss_greedy_div2": loss_greedy_div2,
+        # "loss_greedy_div_agg": loss(partition_greedy_div_forward),
+        # "loss_greedy_div2_agg": loss(partition_greedy_div_plus_forward),
+        "r_mult_agg": r_mult_agg,
+        "r_add_agg": r_add_agg,
+        "r_mult_div2": r_mult_div2,
+        "r_add_div2": r_add_div2
     }
 
 
@@ -211,11 +233,11 @@ if __name__ == "__main__":
 
     step = 0.2
     step_tt = 0.1
-    n_balls = 25
+    n_balls = 40
     threshold_grid = generate_threshold_grid(n_components=N_THRESHOLDS, step=step)
     prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)
     threshold_true_grid = np.arange(step_tt, 1 + step_tt, step_tt).round(5)
-    c_grid = [0.75]
+    c_grid = [0.99]
 
     indices = list(range(N_THRESHOLDS))
     all_partitions = list(set_partitions(indices))
@@ -253,8 +275,8 @@ if __name__ == "__main__":
 
     results_df = pd.DataFrame(all_results)
     print(results_df.shape)
-    # print(results_df.head())
 
-    with open("grid_search_approx_ratio_n6_divisive.pkl", "wb") as f:
+    filepath = f"grid_search_n{N_THRESHOLDS}.pkl"
+    with open(filepath, "wb") as f:
         pickle.dump(results_df, f)
-    print("Saved to grid_search_approx_ratio_n6_divisive.pkl")
+    print(f"Saved to {filepath}")
