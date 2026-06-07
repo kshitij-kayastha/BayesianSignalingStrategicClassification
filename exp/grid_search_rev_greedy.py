@@ -32,12 +32,12 @@ def split_partition(partition, full_split=False):
     for part in itertools.combinations(block_large, len(block_large) - 1):
         A = list(part)
         B = [x for x in block_large if x not in A]
-        result.append([A, B] + block_others)
+        result.append([A] + [B] + block_others)
         if full_split:
             for i, block in enumerate(block_others):
                 merged = sorted(B + block)
                 other_remaining = [block_others[j] for j in range(len(block_others)) if j != i]
-                result.append([A, merged] + other_remaining)
+                result.append([A] + [merged] + other_remaining)
     return result
 
 
@@ -154,14 +154,6 @@ def find_partitions_greedy_divisive(n, block_loss, full_split=False):
         if not pq:
             return partition_merged
 
-def approximation_ratio(loss_optimal, loss_greedy, rtype="m"):
-    if rtype in ["a", "add", "additive"]:
-        return loss_greedy - loss_optimal
-    elif rtype in ["m", "mult", "multiplicative"]:
-        if loss_optimal == 0:
-            return np.nan
-        return loss_greedy / loss_optimal
-
 
 def run(threshold_true, all_partitions, n, X, X_eps, thresholds, priors, Xp_cache, Xp_eps_cache):
     block_loss = make_block_loss(X, X_eps, thresholds, priors, Xp_cache, Xp_eps_cache,
@@ -169,45 +161,31 @@ def run(threshold_true, all_partitions, n, X, X_eps, thresholds, priors, Xp_cach
 
     partition_base = [[i] for i in range(n)]
     partition_opt = find_partitions_optimal(all_partitions, block_loss)
-    partition_greedy_agg = find_partitions_greedy_agglomerative([[i] for i in range(n)], block_loss)
-    # partition_greedy_div = find_partitions_greedy_divisive(n, block_loss, full_split=False)
+    partition_greedy = find_partitions_greedy_agglomerative([[i] for i in range(n)], block_loss)
+    partition_greedy_div = find_partitions_greedy_divisive(n, block_loss, full_split=False)
     partition_greedy_div2 = find_partitions_greedy_divisive(n, block_loss, full_split=True)
-    # partition_greedy_div_forward = find_partitions_greedy_agglomerative(partition_greedy_div, block_loss)
-    # partition_greedy_div_plus_forward = find_partitions_greedy_agglomerative(partition_greedy_div_plus, block_loss)
+    partition_greedy_div_agg = find_partitions_greedy_agglomerative(partition_greedy_div, block_loss)
+    partition_greedy_div2_agg = find_partitions_greedy_agglomerative(partition_greedy_div2, block_loss)
 
     def loss(p):
         return compute_system_loss(p, X, thresholds, priors, Xp_cache, float(threshold_true))
-
-    loss_base = loss(partition_base)
-    loss_opt = loss(partition_opt)
-    loss_greedy_agg = loss(partition_greedy_agg)
-    loss_greedy_div2 = loss(partition_greedy_div2)
-
-    r_mult_agg = approximation_ratio(loss_opt, loss_greedy_agg)
-    r_add_agg = approximation_ratio(loss_opt, loss_greedy_agg, "a")
-    r_mult_div2 = approximation_ratio(loss_opt, loss_greedy_div2)
-    r_add_div2 = approximation_ratio(loss_opt, loss_greedy_div2, "a")
 
     return {
         "threshold_true": float(threshold_true),
         "partition_base": partition_base,
         "partition_opt": partition_opt,
-        "partition_greedy_agg": partition_greedy_agg,
-        # "partition_greedy_div": partition_greedy_div,
+        "partition_greedy": partition_greedy,
+        "partition_greedy_div": partition_greedy_div,
         "partition_greedy_div2": partition_greedy_div2,
-        # "partition_greedy_div_agg": partition_greedy_div_forward,
-        # "partition_greedy_div2_agg": partition_greedy_div_plus_forward,
-        "loss_base": loss_base,
-        "loss_opt": loss_opt,
-        "loss_greedy_agg": loss_greedy_agg,
-        # "loss_greedy_div": loss(partition_greedy_div),
-        "loss_greedy_div2": loss_greedy_div2,
-        # "loss_greedy_div_agg": loss(partition_greedy_div_forward),
-        # "loss_greedy_div2_agg": loss(partition_greedy_div_plus_forward),
-        "r_mult_agg": r_mult_agg,
-        "r_add_agg": r_add_agg,
-        "r_mult_div2": r_mult_div2,
-        "r_add_div2": r_add_div2
+        "partition_greedy_div_agg": partition_greedy_div_agg,
+        "partition_greedy_div2_agg": partition_greedy_div2_agg,
+        "loss_base": loss(partition_base),
+        "loss_opt": loss(partition_opt),
+        "loss_greedy": loss(partition_greedy),
+        "loss_greedy_div": loss(partition_greedy_div),
+        "loss_greedy_div2": loss(partition_greedy_div2),
+        "loss_greedy_div_agg": loss(partition_greedy_div_agg),
+        "loss_greedy_div2_agg": loss(partition_greedy_div2_agg),
     }
 
 
@@ -229,15 +207,15 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     X = np.arange(0., 1. + 1e-4, 1e-4).round(4)
-    N_THRESHOLDS = 6
+    N_THRESHOLDS = 5
 
     step = 0.2
     step_tt = 0.1
-    n_balls = 40
+    n_balls = 25
     threshold_grid = generate_threshold_grid(n_components=N_THRESHOLDS, step=step)
     prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)
     threshold_true_grid = np.arange(step_tt, 1 + step_tt, step_tt).round(5)
-    c_grid = [0.99]
+    c_grid = [0.75]
 
     indices = list(range(N_THRESHOLDS))
     all_partitions = list(set_partitions(indices))
@@ -275,8 +253,8 @@ if __name__ == "__main__":
 
     results_df = pd.DataFrame(all_results)
     print(results_df.shape)
+    print(results_df.head())
 
-    filepath = f"grid_search_n{N_THRESHOLDS}.pkl"
-    with open(filepath, "wb") as f:
+    with open("grid_search_approx_ratio_n5_divisive.pkl", "wb") as f:
         pickle.dump(results_df, f)
-    print(f"Saved to {filepath}")
+    print("Saved to grid_search_approx_ratio_n5_divisive.pkl")
