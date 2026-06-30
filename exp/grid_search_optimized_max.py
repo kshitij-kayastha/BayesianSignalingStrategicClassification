@@ -9,6 +9,7 @@ import pickle
 import heapq
 import itertools
 import contextlib
+from collections import defaultdict
 import joblib
 from joblib import Parallel, delayed
 
@@ -27,6 +28,15 @@ def set_partitions(collection):
         for i in range(len(smaller)):
             yield smaller[:i] + [[first] + smaller[i]] + smaller[i + 1:]
         yield [[first]] + smaller
+
+
+def filter_partitions(partitions):
+    final = []
+    for partition in partitions:
+        if len(partition) == 2:
+            if len(partition[0]) == 2 or len(partition[0]) == 4:
+                final.append(partition)
+    return final
 
 
 def split_partition(partition):
@@ -121,7 +131,9 @@ def make_block_loss(X, X_eps, thresholds, priors, threshold_true, c):
 # ============================================================================
 def optimal_cached(loss, psum, n):
     best_partition, best_loss = None, np.inf
-    for partition in set_partitions(list(range(n))):
+    partitions = set_partitions(list(range(n)))
+    partitions = filter_partitions(partitions)
+    for partition in partitions:
         acc_loss = 0.0
         for block in partition:
             b = tuple(sorted(block))
@@ -213,16 +225,21 @@ def system_loss_cached(partition, loss, psum):
 
 
 # ============================================================================
-# Grid generators
+# Grid generators (unchanged)
 # ============================================================================
 def generate_prior_grid(n_components, n_balls=50):
+    """Search the full simplex with every prior strictly positive.
+
+    Each of the n_components gets at least one ball (=> prior >= 1/n_balls), then
+    the remaining (n_balls - n_components) balls are distributed freely.
+    Grid size is C(n_balls - 1, n_components - 1).
+    """
     step = 1.0 / n_balls
     grids = []
     for combo in itertools.combinations_with_replacement(range(n_components), n_balls - n_components):
         counts = np.bincount(combo, minlength=n_components) + 1
         grids.append((counts * step).round(4))
     return grids
-
 
 
 def generate_threshold_grid(n_components=3, step=0.02):
@@ -372,7 +389,7 @@ def aggregator_to_frames(agg):
 # ============================================================================
 # Parallel driver
 # ============================================================================
-def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c_list, n,
+def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c, n,
                   partition_base, eps=1e-9, validate=False, tol=1e-9,
                   collect="full", top_k=500, n_bins=50, loss_max=1.0):
     """Process one chunk of the prior grid in a single worker.
@@ -392,66 +409,77 @@ def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c_list, n,
     agg = make_aggregator(top_k, n_bins, loss_max) if collect == "aggregate" else None
 
     for priors in priors_chunk:
-        for c in c_list:
-            X_eps = np.arange(-1 / c, 0, 1e-4).round(4)
-            priors = np.asarray(priors, dtype=float)
-            loss, psum = make_block_loss(X, X_eps, thresholds, priors, threshold_true, c)
+        priors = np.asarray(priors, dtype=float)
+        loss, psum = make_block_loss(X, X_eps, thresholds, priors, threshold_true, c)
 
-            # Greedy first -- cheap, and a certified structure short-circuits the
-            # expensive enumeration below.
-            partition_greedy_agg = agglomerative_cached(loss, psum, n, eps)
-            partition_greedy_div = divisive_cached(loss, psum, n, eps)
-            loss_greedy_agg = system_loss_cached(partition_greedy_agg, loss, psum)
-            loss_greedy_div = system_loss_cached(partition_greedy_div, loss, psum)
+        # Greedy first -- cheap, and a certified structure short-circuits the
+        # expensive enumeration below.
+        partition_greedy_agg = agglomerative_cached(loss, psum, n, eps)
+        partition_greedy_div = divisive_cached(loss, psum, n, eps)
+        loss_greedy_agg = system_loss_cached(partition_greedy_agg, loss, psum)
+        loss_greedy_div = system_loss_cached(partition_greedy_div, loss, psum)
 
-            if agg_certifies_optimal(partition_greedy_agg, n):
-                partition_opt, loss_opt, opt_source = partition_greedy_agg, loss_greedy_agg, "agg"
-            elif div_certifies_optimal(partition_greedy_div, n):
-                partition_opt, loss_opt, opt_source = partition_greedy_div, loss_greedy_div, "div"
-            else:
-                partition_opt = optimal_cached(loss, psum, n)
-                loss_opt = system_loss_cached(partition_opt, loss, psum)
-                opt_source = "brute"
+        if agg_certifies_optimal(partition_greedy_agg, n):
+            partition_opt, loss_opt, opt_source = partition_greedy_agg, loss_greedy_agg, "agg"
+        elif div_certifies_optimal(partition_greedy_div, n):
+            partition_opt, loss_opt, opt_source = partition_greedy_div, loss_greedy_div, "div"
+        else:
+            partition_opt = optimal_cached(loss, psum, n)
+            loss_opt = system_loss_cached(partition_opt, loss, psum)
+            opt_source = "brute"
 
-            if validate and opt_source != "brute":
-                partition_brute = optimal_cached(loss, psum, n)
-                loss_brute = system_loss_cached(partition_brute, loss, psum)
-                if not np.isclose(loss_opt, loss_brute, atol=tol, rtol=0.0):
-                    raise AssertionError(
-                        f"certificate '{opt_source}' gave loss {loss_opt:.12g} but "
-                        f"brute-force optimum is {loss_brute:.12g} for "
-                        f"priors={priors.tolist()}"
-                    )
+        if validate and opt_source != "brute":
+            partition_brute = optimal_cached(loss, psum, n)
+            loss_brute = system_loss_cached(partition_brute, loss, psum)
+            if not np.isclose(loss_opt, loss_brute, atol=tol, rtol=0.0):
+                raise AssertionError(
+                    f"certificate '{opt_source}' gave loss {loss_opt:.12g} but "
+                    f"brute-force optimum is {loss_brute:.12g} for "
+                    f"priors={priors.tolist()}"
+                )
 
-            loss_base = system_loss_cached(partition_base, loss, psum)
+        loss_base = system_loss_cached(partition_base, loss, psum)
 
-            if collect == "full":
-                rows.append({
-                    "c": c,
-                    "threshold_true": threshold_true,
-                    "thresholds": thresholds,
-                    "priors": priors,
-                    "partition_base": partition_base,
-                    "partition_opt": partition_opt,
-                    "partition_greedy_agg": partition_greedy_agg,
-                    "partition_greedy_div": partition_greedy_div,
-                    "loss_base": loss_base,
-                    "loss_opt": loss_opt,
-                    "loss_greedy_agg": loss_greedy_agg,
-                    "loss_greedy_div": loss_greedy_div,
-                    "opt_source": opt_source,
-                    "r_mult_agg": approximation_ratio(loss_opt, loss_greedy_agg, "m"),
-                    "r_mult_div": approximation_ratio(loss_opt, loss_greedy_div, "m"),
-                    "r_add_agg": approximation_ratio(loss_opt, loss_greedy_agg, "a"),
-                    "r_add_div": approximation_ratio(loss_opt, loss_greedy_div, "a"),
-                })
-            else:
-                _update_aggregator(agg, priors, loss_base, loss_opt,
-                                loss_greedy_agg, loss_greedy_div,
-                                partition_opt, partition_greedy_agg, partition_greedy_div,
-                                opt_source)
+        if collect == "full":
+            rows.append({
+                "c": c,
+                "threshold_true": threshold_true,
+                "thresholds": thresholds,
+                "priors": priors,
+                "partition_base": partition_base,
+                "partition_opt": partition_opt,
+                "partition_greedy_agg": partition_greedy_agg,
+                "partition_greedy_div": partition_greedy_div,
+                "loss_base": loss_base,
+                "loss_opt": loss_opt,
+                "loss_greedy_agg": loss_greedy_agg,
+                "loss_greedy_div": loss_greedy_div,
+                "opt_source": opt_source,
+                "r_mult_agg": approximation_ratio(loss_opt, loss_greedy_agg, "m"),
+                "r_mult_div": approximation_ratio(loss_opt, loss_greedy_div, "m"),
+                "r_add_agg": approximation_ratio(loss_opt, loss_greedy_agg, "a"),
+                "r_add_div": approximation_ratio(loss_opt, loss_greedy_div, "a"),
+            })
+        else:
+            _update_aggregator(agg, priors, loss_base, loss_opt,
+                               loss_greedy_agg, loss_greedy_div,
+                               partition_opt, partition_greedy_agg, partition_greedy_div,
+                               opt_source)
 
     return rows if collect == "full" else agg
+
+
+def process_combo_chunk(prior_chunk, c, threshold_true, X, thresholds, n,
+                        partition_base, validate=False, collect="aggregate",
+                        top_k=500, n_bins=50, loss_max=1.0):
+    """One task = (prior_chunk, c, threshold_true). Builds X_eps from c, runs the
+    chunk, and tags the result with (c, threshold_true) so results can be grouped
+    back per sweep cell."""
+    X_eps = np.arange(-1.0 / c, 0, 1e-4).round(4)
+    result = process_chunk(prior_chunk, X, X_eps, thresholds, threshold_true, c, n,
+                           partition_base, validate=validate, collect=collect,
+                           top_k=top_k, n_bins=n_bins, loss_max=loss_max)
+    return (c, threshold_true, result)
 
 
 def chunkify(seq, n_chunks):
@@ -480,64 +508,83 @@ def tqdm_joblib(tqdm_object):
 if __name__ == "__main__":
     np.random.seed(0)
 
-    N_THRESHOLDS = 5
+    N_THRESHOLDS = 7
+    n_balls = 25
     X = np.arange(0., 1. + 1e-4, 1e-4).round(4)
-
-    n_balls = 50
-    thresholds = np.array([0.0, 0.2, 0.4, 0.6, 1.0])
-    prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)
-    threshold_true = 0.2
-    c_list = [0.75]
-    # X_eps = np.arange(-1 / c, 0, 1e-4).round(4)
-    X_eps = None
+    # thresholds = np.linspace(0.0, 1.0, N_THRESHOLDS)
+    thresholds = np.array([0.0, 0.2, 0.4, 0.6, 0.7333, 0.8666, 1.0])
+    prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)   # full positive simplex
     partition_base = [[i] for i in range(N_THRESHOLDS)]
+
+    # ---- sweep axes ---------------------------------------------------------
+    c_values = [1.0]
+    tt_values = [0.15]
+    combos = [(c, tt) for c in c_values for tt in tt_values]
 
     # ---- run config ---------------------------------------------------------
     N_JOBS = -1                      # -1 = all cores
-    VALIDATE = False                 # set True on a SMALL grid to check certs
-    COLLECT = "full"                 # "aggregate" for n>=7, "full" for small grids
-    TOP_K = 1000                     # worst cases retained (full payload)
+    VALIDATE = False                 # set True to brute-check greedy certificates
+    TOP_K = 500                      # worst priors retained per (c, t*) cell
     N_BINS = 50                      # baseline-loss bins for the ratio curve
+    PRIOR_CHUNK_SIZE = 20000         # priors per task
 
-    n_workers = joblib.cpu_count()-2 if N_JOBS == -1 else N_JOBS
-    n_chunks = min(len(prior_grid), max(n_workers * 8, n_workers))
-    chunks = chunkify(prior_grid, n_chunks)
+    # Chunk all three axes: tasks = (prior_chunk x c x t*). Each task aggregates
+    # its chunk; aggregators are later grouped by (c, t*) and merged so every
+    # sweep cell keeps its own worst-cases + curve.
+    n_prior_chunks = max(1, len(prior_grid) // PRIOR_CHUNK_SIZE)
+    prior_chunks = chunkify(prior_grid, n_prior_chunks)
+    tasks = [(pc, c, tt) for (c, tt) in combos for pc in prior_chunks]
 
-    print(f"{len(prior_grid)} priors over {len(chunks)} chunks on {n_workers} workers "
-          f"(collect={COLLECT})")
+    n_workers = joblib.cpu_count() if N_JOBS == -1 else N_JOBS
+    print(f"{len(prior_grid):_} priors x {len(combos)} (c, t*) combos "
+          f"= {len(prior_grid) * len(combos):_} evaluations; "
+          f"{len(tasks)} tasks ({len(prior_chunks)} prior-chunks/cell) on {n_workers} workers")
 
-    with tqdm_joblib(tqdm.tqdm(total=len(chunks), desc="chunks")):
-        results_nested = Parallel(n_jobs=N_JOBS)(
-            delayed(process_chunk)(
-                chunk, X, X_eps, thresholds, threshold_true, c_list,
-                N_THRESHOLDS, partition_base,
-                validate=VALIDATE, collect=COLLECT, top_k=TOP_K, n_bins=N_BINS,
+    with tqdm_joblib(tqdm.tqdm(total=len(tasks), desc="tasks")):
+        results_flat = Parallel(n_jobs=N_JOBS)(
+            delayed(process_combo_chunk)(
+                pc, c, tt, X, thresholds, N_THRESHOLDS, partition_base,
+                validate=VALIDATE, collect="aggregate",
+                top_k=TOP_K, n_bins=N_BINS,
             )
-            for chunk in chunks
+            for (pc, c, tt) in tasks
         )
 
-    if COLLECT == "full":
-        results = [r for sub in results_nested for r in sub]
-        df_results = pd.DataFrame(results)
-        print(df_results.shape)
-        print(df_results["opt_source"].value_counts())
-        filepath = f"grid_search_n{N_THRESHOLDS}_c_0.75.pkl"
-        # filepath = f"grid_search_n{N_THRESHOLDS}_refined_p1_{p1}.pkl"
-        with open(filepath, "wb") as f:
-            pickle.dump(df_results, f)
-        print(f"Saved to {filepath}")
-    else:
-        agg = merge_aggregates(results_nested)
-        worst_df, curve_df = aggregator_to_frames(agg)
-        print(f"priors processed: {agg['n']}")
-        print(f"opt source counts: {agg['opt_source']}")
+    # ---- group the per-chunk aggregators back into one per (c, t*) ----------
+    groups = defaultdict(list)
+    for c, tt, agg in results_flat:
+        groups[(c, tt)].append(agg)
+
+    per_combo = {}
+    summary_rows = []
+    for (c, tt), aggs in groups.items():
+        merged = merge_aggregates(aggs)
+        worst_df, curve_df = aggregator_to_frames(merged)
+        per_combo[(c, tt)] = {"agg": merged, "worst": worst_df, "curve": curve_df}
+
+        max_r_min = np.nan
         if len(worst_df):
-            print(f"top worst-case r_min: {worst_df.iloc[0]['r_mult_agg']:.4g} (agg) / "
-                  f"{worst_df.iloc[0]['r_mult_div']:.4g} (div)")
-        filepath = f"grid_search_n{N_THRESHOLDS}_agg.pkl"
-        with open(filepath, "wb") as f:
-            pickle.dump({"aggregator": agg, "worst": worst_df, "curve": curve_df,
-                         "meta": {"c": c_list, "threshold_true": threshold_true,
-                                  "thresholds": thresholds, "n_balls": n_balls}
-                                  }, f)
-        print(f"Saved to {filepath}")
+            top = worst_df.iloc[0]
+            finite = [r for r in (top["r_mult_agg"], top["r_mult_div"]) if pd.notna(r)]
+            max_r_min = min(finite) if finite else np.nan
+        summary_rows.append({"c": c, "threshold_true": tt,
+                             "max_r_min": max_r_min, "n": merged["n"],
+                             "opt_brute": merged["opt_source"]["brute"]})
+
+    summary = pd.DataFrame(summary_rows).sort_values(["c", "threshold_true"])
+    pivot = summary.pivot(index="c", columns="threshold_true", values="max_r_min")
+    print("\nmax r_min by (c, threshold_true):")
+    print(pivot.round(3))
+
+    overall = summary.loc[summary["max_r_min"].idxmax()] if summary["max_r_min"].notna().any() else None
+    if overall is not None:
+        print(f"\npeak ratio {overall['max_r_min']:.4g} at "
+              f"c={overall['c']}, t*={overall['threshold_true']}")
+
+    filepath = f"grid_search_n{N_THRESHOLDS}_c_tt_sweep_heuristic_exact.pkl"
+    with open(filepath, "wb") as f:
+        pickle.dump({"per_combo": per_combo, "summary": summary, "pivot": pivot,
+                     "meta": {"thresholds": thresholds, "n_balls": n_balls,
+                              "c_values": c_values, "tt_values": tt_values,
+                              "top_k": TOP_K, "n_bins": N_BINS}}, f)
+    print(f"Saved to {filepath}")
