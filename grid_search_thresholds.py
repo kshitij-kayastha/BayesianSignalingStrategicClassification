@@ -31,6 +31,11 @@ def set_partitions(collection):
 
 
 def filter_partitions(partitions):
+    # NOTE: this is an *ordering-dependent* restriction, not a clean "(2,3)+(4,1)"
+    # enumerator -- it only keeps partitions whose first-listed block has size 2
+    # or 4, which at n=5 is 6 of the 10 possible (2,3) splits and 1 of the 5
+    # possible (4,1) splits. Kept for the prior sweep's back-compat only; the
+    # threshold sweep uses full enumeration (restrict=False) below.
     final = []
     for partition in partitions:
         if len(partition) == 2:
@@ -56,9 +61,7 @@ def split_partition(partition):
 
 
 # ============================================================================
-# Original loss helpers (kept for compatibility with other utilities, e.g.
-# construct_worst_case / find_worst_case). The grid search itself no longer
-# calls these directly -- it goes through the memoized layer below.
+# Original loss helpers (kept for compatibility with other utilities).
 # ============================================================================
 def compute_partition_loss(X, partition, thresholds, priors, threshold_true, c):
     thresholds_p = thresholds[partition]
@@ -85,17 +88,9 @@ def approximation_ratio(loss_optimal, loss_greedy, rtype="m"):
 
 
 # ============================================================================
-# Per-prior memoized block-loss cache
-# ----------------------------------------------------------------------------
-# All three searches (agglomerative / divisive / optimal) repeatedly evaluate
-# the loss of the SAME block for a given prior. We memoize on (data_tag, block)
-# so each unique block is fed through best_response_vectorized at most once per
-# prior. The cache is local to a single prior, so it stays tiny (<= 2*(2^n - 1)
-# entries) and there is no cross-process state to manage.
-#
-# tag = 0 -> evaluate against X      (used by all three searches)
-# tag = 1 -> evaluate against X_eps  (used only by the greedy tie-breaker)
-# `block` is always a sorted tuple of indices, so keys are canonical.
+# Per-config memoized block-loss cache (unchanged).
+# A fresh memo is built per swept config (per prior OR per threshold vector),
+# so it stays tiny and there is no cross-process state to manage.
 # ============================================================================
 def make_block_loss(X, X_eps, thresholds, priors, threshold_true, c):
     loss_cache = {}
@@ -125,14 +120,13 @@ def make_block_loss(X, X_eps, thresholds, priors, threshold_true, c):
 
 
 # ============================================================================
-# Cached searches. Logic is identical to the originals; only the loss
-# computation is routed through the memo. (Exception: optimal uses proper
-# system loss -- see note in the accompanying message.)
+# Cached searches (unchanged except optimal_cached gains a `restrict` flag).
 # ============================================================================
-def optimal_cached(loss, psum, n):
+def optimal_cached(loss, psum, n, restrict=False):
     best_partition, best_loss = None, np.inf
     partitions = set_partitions(list(range(n)))
-    partitions = filter_partitions(partitions)
+    if restrict:
+        partitions = filter_partitions(partitions)
     for partition in partitions:
         acc_loss = 0.0
         for block in partition:
@@ -225,15 +219,9 @@ def system_loss_cached(partition, loss, psum):
 
 
 # ============================================================================
-# Grid generators (unchanged)
+# Grid generators
 # ============================================================================
 def generate_prior_grid(n_components, n_balls=50):
-    """Search the full simplex with every prior strictly positive.
-
-    Each of the n_components gets at least one ball (=> prior >= 1/n_balls), then
-    the remaining (n_balls - n_components) balls are distributed freely.
-    Grid size is C(n_balls - 1, n_components - 1).
-    """
     step = 1.0 / n_balls
     grids = []
     for combo in itertools.combinations_with_replacement(range(n_components), n_balls - n_components):
@@ -242,37 +230,31 @@ def generate_prior_grid(n_components, n_balls=50):
     return grids
 
 
-def generate_threshold_grid(n_components=3, step=0.02):
-    ticks = np.arange(0, 1 + step, step).round(5)
+def generate_threshold_grid(n_components=3, step=0.02, lo=0.0, hi=1.0):
+    """All strictly-increasing threshold vectors on a regular tick grid.
+
+    Ticks run from `lo` to `hi` in steps of `step`; each vector is an ascending
+    combination of `n_components` distinct ticks (so classifier index order ==
+    ascending threshold order, and no two classifiers share a threshold).
+    Grid size is C(#ticks, n_components).
+    """
+    ticks = np.arange(lo, hi + step, step).round(5)
     return [np.array(combo) for combo in itertools.combinations(ticks, n_components)]
 
 
 # ============================================================================
-# Optimality certificates
-# ----------------------------------------------------------------------------
-# When a greedy search lands on one of these structures, the result is provably
-# optimal, so we can skip the brute-force enumeration for that prior entirely.
-# Checked by block-size signature, so it is index-agnostic (any pair / any
-# singleton qualifies).
+# Optimality certificates (unchanged, index-agnostic by block-size signature).
 # ============================================================================
 def _block_sizes(partition):
     return sorted(len(b) for b in partition)
 
 
 def agg_certifies_optimal(partition, n):
-    """Agglomerative output known to be optimal:
-       - all singletons             -> sizes [1, ..., 1]
-       - one pair + rest singletons -> sizes [1, ..., 1, 2]
-    """
     sizes = _block_sizes(partition)
     return sizes == [1] * n or sizes == [1] * (n - 2) + [2]
 
 
 def div_certifies_optimal(partition, n):
-    """Divisive output known to be optimal:
-       - grand partition            -> sizes [n]
-       - one singleton + rest        -> sizes [1, n - 1]
-    """
     sizes = _block_sizes(partition)
     return sizes == [n] or sizes == [1, n - 1]
 
@@ -280,20 +262,14 @@ def div_certifies_optimal(partition, n):
 # ============================================================================
 # Streaming aggregation
 # ----------------------------------------------------------------------------
-# At n=7 the prior grid is ~18M points; materializing one row per prior is not
-# viable. Instead each worker keeps an O(top_k + n_bins) summary:
-#   - counts of which path produced the optimum (agg / div / brute),
-#   - the top_k worst priors by each ratio metric (full payload retained so
-#     you can re-run / locally refine those),
-#   - per-baseline-loss-bin count / sum / max of min(r_agg, r_div), which is
-#     the ratio-vs-baseline-loss curve.
-# merge_aggregates() combines the per-worker summaries.
+# _update_aggregator now records the *thresholds* alongside the priors so a
+# threshold sweep's worst cases are identifiable (priors are constant then).
 # ============================================================================
 def make_aggregator(top_k=500, n_bins=50, loss_max=1.0):
     return {
         "n": 0,
         "opt_source": {"agg": 0, "div": 0, "brute": 0},
-        "top_agg": [], "top_div": [], "top_min": [],   # min-heaps of (r, ctr, payload)
+        "top_agg": [], "top_div": [], "top_min": [],
         "top_k": top_k,
         "n_bins": n_bins,
         "loss_max": loss_max,
@@ -313,7 +289,7 @@ def _push_topk(heap, k, value, payload, ctr):
         heapq.heapreplace(heap, (value, ctr, payload))
 
 
-def _update_aggregator(agg, priors, loss_base, loss_opt,
+def _update_aggregator(agg, priors, thresholds, loss_base, loss_opt,
                        loss_greedy_agg, loss_greedy_div,
                        partition_opt, partition_greedy_agg, partition_greedy_div,
                        opt_source):
@@ -326,7 +302,8 @@ def _update_aggregator(agg, priors, loss_base, loss_opt,
     r_min = min(finite) if finite else np.nan
 
     payload = {
-        "priors": priors.astype(np.float32),
+        "priors": np.asarray(priors, dtype=np.float32),
+        "thresholds": np.asarray(thresholds, dtype=np.float32),
         "loss_base": loss_base, "loss_opt": loss_opt,
         "loss_greedy_agg": loss_greedy_agg, "loss_greedy_div": loss_greedy_div,
         "partition_opt": partition_opt,
@@ -366,7 +343,6 @@ def merge_aggregates(aggs):
 
 
 def aggregator_to_frames(agg):
-    """Turn a merged aggregator into (worst_cases_df, baseline_curve_df)."""
     worst = pd.DataFrame(sorted((p for _, _, p in agg["top_min"]),
                                 key=lambda d: -(min(r for r in (d["r_mult_agg"], d["r_mult_div"])
                                                     if r is not None and not np.isnan(r))
@@ -387,58 +363,60 @@ def aggregator_to_frames(agg):
 
 
 # ============================================================================
-# Parallel driver
+# Core per-config evaluation (shared body)
 # ============================================================================
-def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c, n,
-                  partition_base, eps=1e-9, validate=False, tol=1e-9,
-                  collect="full", top_k=500, n_bins=50, loss_max=1.0):
-    """Process one chunk of the prior grid in a single worker.
+def _evaluate_config(loss, psum, n, partition_base, eps,
+                     validate, tol, restrict):
+    """Run all three searches on one already-built (loss, psum) memo and return
+    everything needed to log a row / update the aggregator."""
+    partition_greedy_agg = agglomerative_cached(loss, psum, n, eps)
+    partition_greedy_div = divisive_cached(loss, psum, n, eps)
+    loss_greedy_agg = system_loss_cached(partition_greedy_agg, loss, psum)
+    loss_greedy_div = system_loss_cached(partition_greedy_div, loss, psum)
 
-    A fresh memo is built per prior, so memory stays bounded while every
-    redundant block evaluation within that prior is eliminated.
+    if agg_certifies_optimal(partition_greedy_agg, n):
+        partition_opt, loss_opt, opt_source = partition_greedy_agg, loss_greedy_agg, "agg"
+    elif div_certifies_optimal(partition_greedy_div, n):
+        partition_opt, loss_opt, opt_source = partition_greedy_div, loss_greedy_div, "div"
+    else:
+        partition_opt = optimal_cached(loss, psum, n, restrict=restrict)
+        loss_opt = system_loss_cached(partition_opt, loss, psum)
+        opt_source = "brute"
 
-    Greedy runs first: if its output carries an optimality certificate we
-    take it as the optimum and skip the brute-force search. Set validate=True
-    to additionally brute-force the certified priors and assert the certificate
-    holds -- run this once on a small grid to be safe.
+    if validate and opt_source != "brute":
+        partition_brute = optimal_cached(loss, psum, n, restrict=restrict)
+        loss_brute = system_loss_cached(partition_brute, loss, psum)
+        if not np.isclose(loss_opt, loss_brute, atol=tol, rtol=0.0):
+            raise AssertionError(
+                f"certificate '{opt_source}' gave loss {loss_opt:.12g} but "
+                f"brute-force optimum is {loss_brute:.12g}"
+            )
 
-    collect="full"      -> return a list of per-prior dicts (small grids only).
-    collect="aggregate" -> return an O(top_k + n_bins) summary (use at n>=7).
-    """
+    loss_base = system_loss_cached(partition_base, loss, psum)
+    return (partition_opt, loss_opt, opt_source,
+            partition_greedy_agg, partition_greedy_div,
+            loss_greedy_agg, loss_greedy_div, loss_base)
+
+
+# ============================================================================
+# THRESHOLD sweep chunk (priors fixed, thresholds vary)
+# ============================================================================
+def process_threshold_chunk(thresholds_chunk, X, X_eps, priors, threshold_true, c, n,
+                            partition_base, eps=1e-9, validate=False, tol=1e-9,
+                            collect="full", top_k=500, n_bins=50, loss_max=1.0,
+                            restrict=False):
     rows = [] if collect == "full" else None
     agg = make_aggregator(top_k, n_bins, loss_max) if collect == "aggregate" else None
+    priors = np.asarray(priors, dtype=float)
 
-    for priors in priors_chunk:
-        priors = np.asarray(priors, dtype=float)
+    for thresholds in thresholds_chunk:
+        thresholds = np.asarray(thresholds, dtype=float)
         loss, psum = make_block_loss(X, X_eps, thresholds, priors, threshold_true, c)
 
-        # Greedy first -- cheap, and a certified structure short-circuits the
-        # expensive enumeration below.
-        partition_greedy_agg = agglomerative_cached(loss, psum, n, eps)
-        partition_greedy_div = divisive_cached(loss, psum, n, eps)
-        loss_greedy_agg = system_loss_cached(partition_greedy_agg, loss, psum)
-        loss_greedy_div = system_loss_cached(partition_greedy_div, loss, psum)
-
-        if agg_certifies_optimal(partition_greedy_agg, n):
-            partition_opt, loss_opt, opt_source = partition_greedy_agg, loss_greedy_agg, "agg"
-        elif div_certifies_optimal(partition_greedy_div, n):
-            partition_opt, loss_opt, opt_source = partition_greedy_div, loss_greedy_div, "div"
-        else:
-            partition_opt = optimal_cached(loss, psum, n)
-            loss_opt = system_loss_cached(partition_opt, loss, psum)
-            opt_source = "brute"
-
-        if validate and opt_source != "brute":
-            partition_brute = optimal_cached(loss, psum, n)
-            loss_brute = system_loss_cached(partition_brute, loss, psum)
-            if not np.isclose(loss_opt, loss_brute, atol=tol, rtol=0.0):
-                raise AssertionError(
-                    f"certificate '{opt_source}' gave loss {loss_opt:.12g} but "
-                    f"brute-force optimum is {loss_brute:.12g} for "
-                    f"priors={priors.tolist()}"
-                )
-
-        loss_base = system_loss_cached(partition_base, loss, psum)
+        (partition_opt, loss_opt, opt_source,
+         partition_greedy_agg, partition_greedy_div,
+         loss_greedy_agg, loss_greedy_div, loss_base) = _evaluate_config(
+            loss, psum, n, partition_base, eps, validate, tol, restrict)
 
         if collect == "full":
             rows.append({
@@ -461,7 +439,68 @@ def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c, n,
                 "r_add_div": approximation_ratio(loss_opt, loss_greedy_div, "a"),
             })
         else:
-            _update_aggregator(agg, priors, loss_base, loss_opt,
+            _update_aggregator(agg, priors, thresholds, loss_base, loss_opt,
+                               loss_greedy_agg, loss_greedy_div,
+                               partition_opt, partition_greedy_agg, partition_greedy_div,
+                               opt_source)
+
+    return rows if collect == "full" else agg
+
+
+def process_combo_chunk_thresholds(threshold_chunk, c, threshold_true, X, priors, n,
+                                   partition_base, validate=False, collect="aggregate",
+                                   top_k=500, n_bins=50, loss_max=1.0, restrict=False):
+    """One task = (threshold_chunk, c, threshold_true). Builds X_eps from c,
+    runs the chunk with fixed uniform priors, and tags the result with
+    (c, threshold_true) so results can be grouped back per sweep cell."""
+    X_eps = np.arange(-1.0 / c, 0, 1e-4).round(4)
+    result = process_threshold_chunk(threshold_chunk, X, X_eps, priors, threshold_true, c, n,
+                                     partition_base, validate=validate, collect=collect,
+                                     top_k=top_k, n_bins=n_bins, loss_max=loss_max,
+                                     restrict=restrict)
+    return (c, threshold_true, result)
+
+
+# ============================================================================
+# PRIOR sweep chunk (kept intact; now also logs the fixed thresholds)
+# ============================================================================
+def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c, n,
+                  partition_base, eps=1e-9, validate=False, tol=1e-9,
+                  collect="full", top_k=500, n_bins=50, loss_max=1.0, restrict=False):
+    rows = [] if collect == "full" else None
+    agg = make_aggregator(top_k, n_bins, loss_max) if collect == "aggregate" else None
+
+    for priors in priors_chunk:
+        priors = np.asarray(priors, dtype=float)
+        loss, psum = make_block_loss(X, X_eps, thresholds, priors, threshold_true, c)
+
+        (partition_opt, loss_opt, opt_source,
+         partition_greedy_agg, partition_greedy_div,
+         loss_greedy_agg, loss_greedy_div, loss_base) = _evaluate_config(
+            loss, psum, n, partition_base, eps, validate, tol, restrict)
+
+        if collect == "full":
+            rows.append({
+                "c": c,
+                "threshold_true": threshold_true,
+                "thresholds": thresholds,
+                "priors": priors,
+                "partition_base": partition_base,
+                "partition_opt": partition_opt,
+                "partition_greedy_agg": partition_greedy_agg,
+                "partition_greedy_div": partition_greedy_div,
+                "loss_base": loss_base,
+                "loss_opt": loss_opt,
+                "loss_greedy_agg": loss_greedy_agg,
+                "loss_greedy_div": loss_greedy_div,
+                "opt_source": opt_source,
+                "r_mult_agg": approximation_ratio(loss_opt, loss_greedy_agg, "m"),
+                "r_mult_div": approximation_ratio(loss_opt, loss_greedy_div, "m"),
+                "r_add_agg": approximation_ratio(loss_opt, loss_greedy_agg, "a"),
+                "r_add_div": approximation_ratio(loss_opt, loss_greedy_div, "a"),
+            })
+        else:
+            _update_aggregator(agg, priors, thresholds, loss_base, loss_opt,
                                loss_greedy_agg, loss_greedy_div,
                                partition_opt, partition_greedy_agg, partition_greedy_div,
                                opt_source)
@@ -471,14 +510,11 @@ def process_chunk(priors_chunk, X, X_eps, thresholds, threshold_true, c, n,
 
 def process_combo_chunk(prior_chunk, c, threshold_true, X, thresholds, n,
                         partition_base, validate=False, collect="aggregate",
-                        top_k=500, n_bins=50, loss_max=1.0):
-    """One task = (prior_chunk, c, threshold_true). Builds X_eps from c, runs the
-    chunk, and tags the result with (c, threshold_true) so results can be grouped
-    back per sweep cell."""
+                        top_k=500, n_bins=50, loss_max=1.0, restrict=False):
     X_eps = np.arange(-1.0 / c, 0, 1e-4).round(4)
     result = process_chunk(prior_chunk, X, X_eps, thresholds, threshold_true, c, n,
                            partition_base, validate=validate, collect=collect,
-                           top_k=top_k, n_bins=n_bins, loss_max=loss_max)
+                           top_k=top_k, n_bins=n_bins, loss_max=loss_max, restrict=restrict)
     return (c, threshold_true, result)
 
 
@@ -490,7 +526,6 @@ def chunkify(seq, n_chunks):
 
 @contextlib.contextmanager
 def tqdm_joblib(tqdm_object):
-    """Let a tqdm bar advance as joblib tasks complete."""
     class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
         def __call__(self, *args, **kwargs):
             tqdm_object.update(n=self.batch_size)
@@ -508,49 +543,52 @@ def tqdm_joblib(tqdm_object):
 if __name__ == "__main__":
     np.random.seed(0)
 
-    N_THRESHOLDS = 7
-    n_balls = 25
+    N_THRESHOLDS = 5
     X = np.arange(0., 1. + 1e-4, 1e-4).round(4)
-    # thresholds = np.linspace(0.0, 1.0, N_THRESHOLDS)
-    thresholds = np.array([0.0, 0.2, 0.4, 0.6, 0.7333, 0.8666, 1.0])
-    prior_grid = generate_prior_grid(N_THRESHOLDS, n_balls=n_balls)   # full positive simplex
+
+    # ---- priors are FIXED to uniform: each classifier gets 1/n ----------------
+    priors = np.full(N_THRESHOLDS, 1.0 / N_THRESHOLDS)
+
+    # ---- search axis is now the threshold vector ------------------------------
+    # step 0.05 -> C(21,5) = 20,349 vectors (fast first pass; verify, then refine)
+    # step 0.02 -> C(51,5) = 2,349,060 vectors
+    THRESH_STEP = 0.05
+    threshold_grid = generate_threshold_grid(N_THRESHOLDS, step=THRESH_STEP)
     partition_base = [[i] for i in range(N_THRESHOLDS)]
 
-    # ---- sweep axes ---------------------------------------------------------
-    c_values = [1.0]
-    tt_values = [0.15]
+    # ---- sweep axes -----------------------------------------------------------
+    c_values = [0.7, 0.8, 0.9, 1.0]
+    tt_values = [0.01, 0.05, 0.1, 0.15, 0.2]
     combos = [(c, tt) for c in c_values for tt in tt_values]
 
-    # ---- run config ---------------------------------------------------------
-    N_JOBS = -1                      # -1 = all cores
-    VALIDATE = False                 # set True to brute-check greedy certificates
-    TOP_K = 500                      # worst priors retained per (c, t*) cell
-    N_BINS = 50                      # baseline-loss bins for the ratio curve
-    PRIOR_CHUNK_SIZE = 20000         # priors per task
+    # ---- run config -----------------------------------------------------------
+    N_JOBS = -1
+    VALIDATE = False        # set True on a first coarse pass to brute-check the certificates
+    RESTRICT_OPTIMAL = False  # False = full Bell(5)=52 enumeration (true optimum, cheap at n=5)
+    TOP_K = 500
+    N_BINS = 50
+    THRESH_CHUNK_SIZE = 2000  # thresholds per task
 
-    # Chunk all three axes: tasks = (prior_chunk x c x t*). Each task aggregates
-    # its chunk; aggregators are later grouped by (c, t*) and merged so every
-    # sweep cell keeps its own worst-cases + curve.
-    n_prior_chunks = max(1, len(prior_grid) // PRIOR_CHUNK_SIZE)
-    prior_chunks = chunkify(prior_grid, n_prior_chunks)
-    tasks = [(pc, c, tt) for (c, tt) in combos for pc in prior_chunks]
+    n_chunks = max(1, len(threshold_grid) // THRESH_CHUNK_SIZE)
+    threshold_chunks = chunkify(threshold_grid, n_chunks)
+    tasks = [(tc, c, tt) for (c, tt) in combos for tc in threshold_chunks]
 
     n_workers = joblib.cpu_count() if N_JOBS == -1 else N_JOBS
-    print(f"{len(prior_grid):_} priors x {len(combos)} (c, t*) combos "
-          f"= {len(prior_grid) * len(combos):_} evaluations; "
-          f"{len(tasks)} tasks ({len(prior_chunks)} prior-chunks/cell) on {n_workers} workers")
+    print(f"{len(threshold_grid):_} threshold vectors x {len(combos)} (c, t*) combos "
+          f"= {len(threshold_grid) * len(combos):_} evaluations; "
+          f"{len(tasks)} tasks ({len(threshold_chunks)} thresh-chunks/cell) on {n_workers} workers")
 
     with tqdm_joblib(tqdm.tqdm(total=len(tasks), desc="tasks")):
         results_flat = Parallel(n_jobs=N_JOBS)(
-            delayed(process_combo_chunk)(
-                pc, c, tt, X, thresholds, N_THRESHOLDS, partition_base,
+            delayed(process_combo_chunk_thresholds)(
+                tc, c, tt, X, priors, N_THRESHOLDS, partition_base,
                 validate=VALIDATE, collect="aggregate",
-                top_k=TOP_K, n_bins=N_BINS,
+                top_k=TOP_K, n_bins=N_BINS, restrict=RESTRICT_OPTIMAL,
             )
-            for (pc, c, tt) in tasks
+            for (tc, c, tt) in tasks
         )
 
-    # ---- group the per-chunk aggregators back into one per (c, t*) ----------
+    # ---- group the per-chunk aggregators back into one per (c, t*) ------------
     groups = defaultdict(list)
     for c, tt, agg in results_flat:
         groups[(c, tt)].append(agg)
@@ -580,11 +618,19 @@ if __name__ == "__main__":
     if overall is not None:
         print(f"\npeak ratio {overall['max_r_min']:.4g} at "
               f"c={overall['c']}, t*={overall['threshold_true']}")
+        # show the worst threshold vector for that cell
+        wc = per_combo[(overall['c'], overall['threshold_true'])]["worst"]
+        if len(wc):
+            print("worst thresholds:", wc.iloc[0]["thresholds"],
+                  "| opt:", wc.iloc[0]["partition_opt"],
+                  "| agg:", wc.iloc[0]["partition_greedy_agg"],
+                  "| div:", wc.iloc[0]["partition_greedy_div"])
 
-    filepath = f"grid_search_n{N_THRESHOLDS}_c_tt_sweep_heuristic_exact.pkl"
+    filepath = f"grid_search_n{N_THRESHOLDS}_threshold_sweep.pkl"
     with open(filepath, "wb") as f:
         pickle.dump({"per_combo": per_combo, "summary": summary, "pivot": pivot,
-                     "meta": {"thresholds": thresholds, "n_balls": n_balls,
+                     "meta": {"priors": priors, "thresh_step": THRESH_STEP,
                               "c_values": c_values, "tt_values": tt_values,
+                              "restrict_optimal": RESTRICT_OPTIMAL,
                               "top_k": TOP_K, "n_bins": N_BINS}}, f)
     print(f"Saved to {filepath}")
