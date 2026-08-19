@@ -200,6 +200,44 @@ def solve(priors, thresholds, tt, c, m=51, eps=1e-6, prune=True, pin_empty=True,
         K=K
     )
 
+def solve_milp(priors, thresholds, tt, c, m=51, eps=1e-6, reduce=True, pin_empty=True, feas_tol=1e-9, check_tol=1e-9, time_limit=None, solver=cp.GUROBI):
+    K = build_constants(priors, thresholds, tt, c, m, eps)
+    xv, yv, cons = build_variables(K)
+    cons = cons + add_best_response(K, xv, yv)
+    if reduce:
+        cons = cons + add_symmetry(K, xv)
+    if pin_empty:
+        cons = cons + pin_empty_bins(K, xv, yv)
+    obj, obj_cons = add_objective(K, xv, yv)
+
+    prob = cp.Problem(cp.Minimize(obj), cons + obj_cons)
+    if str(solver).upper() == 'GUROBI':
+        kw = {"FeasibilityTol": feas_tol, "IntFeasTol": feas_tol}
+        if time_limit is not None:
+            kw["TimeLimit"] = time_limit
+    else:
+        kw = dict(primal_feasibility_tolerance=feas_tol, mip_feasibility_tolerance=feas_tol)
+        if time_limit is not None:
+            kw["time_limit"] = time_limit
+    
+    t0 = time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        prob.solve(solver=solver, **kw)
+    elapsed = time.perf_counter() - t0
+
+    assign = np.asarray(xv.value).argmax(axis=1)
+    loss = evaluate_partition(K, assign)
+    return dict(
+        status=prob.status,
+        partition=sorted(sorted(b) for b in assignment_to_partition(assign)),
+        loss=loss,
+        solver_objective=float(prob.value),
+        certified=bool(loss - float(prob.value) < check_tol),
+        seconds=elapsed,
+        K=K
+    )
+
 def brute_force(K):
     t0 = time.perf_counter()
     n = K["n"]
